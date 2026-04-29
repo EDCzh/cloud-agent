@@ -1,7 +1,6 @@
 """
- * 小滴课堂,愿景：让技术不再难学
- * @Remark 有问题联系我【xdclass68】
- * 源码-笔记-技术交流群,官网 https://xdclass.net
+中心路由模块 (Orchestrator)
+负责分析用户意图，并将请求分发给相应的专业 Agent。
 """
 import os
 from typing import Dict, Any

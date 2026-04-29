@@ -1,8 +1,3 @@
-"""
- * 小滴课堂,愿景：让技术不再难学
- * @Remark 有问题联系我【xdclass68】
- * 源码-笔记-技术交流群,官网 https://xdclass.net
-"""
 import os
 import json
 import asyncio
@@ -95,8 +90,6 @@ class BillingAgentNode:
         # 为了兼容 FastAPI 的多线程/事件循环，这里我们每次新建 client 但不主动销毁（依靠垃圾回收），
         # 或者最好是通过全局依赖注入。
         # 此前报错是由于我们在 async with 中导致它被当做 context manager
-
-
         #MultiServerMCPClient: 这是一个支持多服务连接的客户端
         #connections: 传入配置文件（mcp_servers.json）里定义的服务地址，告诉 Agent 去哪里找数据。
         #tool_interceptors=[UserIdInjector()]: 这是关键的安全组件。它挂载了一个拦截器，
@@ -120,7 +113,6 @@ class BillingAgentNode:
             {"messages": state["messages"]}, 
             config=config
         )
-        
         # 尝试清理相关子进程（如果有暴露的关闭方法，但目前版本似乎没有公开的无参 close() 或者不支持 async with）
         # client 本身在执行完毕后可能会有一些资源未释放，这是 langchain_mcp_adapters 当前版本的限制。
         

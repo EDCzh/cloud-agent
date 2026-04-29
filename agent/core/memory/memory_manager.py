@@ -267,7 +267,7 @@ class MemoryManager:
     # ------------------------------------------------------------------
     # Session finalization
     # ------------------------------------------------------------------
-#finalize_session(user_id, session_id, llm): 会话收尾工作
+    #finalize_session(user_id, session_id, llm): 会话收尾工作
     """
     1.调用 LLM 提取本轮会话产生的所有新偏好。
     2.去重后存入 Milvus（长期记忆）。
