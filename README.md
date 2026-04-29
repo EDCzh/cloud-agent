@@ -518,7 +518,7 @@ docker logs -f milvus-standalone
 如有问题或建议，请提交 Issue 或通过以下方式联系：
 
 - 项目地址: https://github.com/your-username/cloud-agent
-- 邮箱: your-email@example.com
+- 邮箱: 2297852620@qq.com
 
 ---
 
