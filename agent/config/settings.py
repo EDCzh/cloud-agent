@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     # LLM Configuration
     dashscope_api_key: str = Field(alias="DASHSCOPE_API_KEY")
     model: str = Field(default="qwen-plus", alias="MODEL")
+    memory_summary_model: str = Field(default="qwen-turbo", alias="MEMORY_SUMMARY_MODEL")
+    preference_extract_model: str = Field(default="qwen-turbo", alias="PREFERENCE_EXTRACT_MODEL")
     base_url: str | None = Field(default=None, alias="BASE_URL")
     
     # MCP Configuration

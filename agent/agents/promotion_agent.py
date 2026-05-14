@@ -3,7 +3,7 @@ import json
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from .mcp_client_cache import LazyMCPTools
 from typing import Dict, Any
 
 from ..core.workflow.state import AgentState  # .. 表示上一级目录 (agent/)
@@ -28,22 +28,27 @@ class PromotionAgentNode:
         config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'mcp_servers.json')
         with open(config_path, 'r', encoding='utf-8') as f:
             self.servers_config = json.load(f)
+        self._mcp_tools = LazyMCPTools(
+            self.servers_config.get("mcpServers", {}),
+            {
+                "get_promotable_products",
+                "search_product_catalog",
+                "get_promotion_materials",
+                "generate_ai_poster",
+            },
+            interceptors_factory=lambda: [UserIdInjector()],
+        )
 
     async def _ensure_tools(self):
-        pass
+        return await self._mcp_tools.get_tools()
+
+    async def close(self):
+        await self._mcp_tools.close()
 
     async def __call__(self, state: AgentState) -> Dict[str, Any]:
         config = {"configurable": {"user_id": state.get("user_id", "unknown")}}
         
-        # 每次调用重新初始化 MCP 客户端，避免使用不支持的 async with
-        client = MultiServerMCPClient(
-            connections=self.servers_config.get("mcpServers", {}),
-            tool_interceptors=[UserIdInjector()]
-        )
-        all_tools = await client.get_tools()
-        target_tools = ["get_promotable_products", "search_product_catalog", "get_promotion_materials", "generate_ai_poster"]
-        tools = [t for t in all_tools if t.name in target_tools]
-
+        tools = await self._ensure_tools()
         memory_context = state.get("memory_context", "")
         
         system_prompt = f"""你是一个热情的云服务平台【推广营销Agent】。

@@ -76,22 +76,14 @@ class LongTermMemory:
         Sets _available=False on failure (no exception raised).
         """
         try:
-            from pymilvus import MilvusClient  # type: ignore[import]
-            from langchain_community.embeddings import DashScopeEmbeddings  # type: ignore[import]
-
-            uri = f"http://{self._host}:{self._port}"
-            connect_kwargs: dict[str, Any] = {"uri": uri}
-            if self._api_key:
-                connect_kwargs["token"] = self._api_key
-
-            self._client = MilvusClient(**connect_kwargs)
-            self._embeddings = DashScopeEmbeddings(
-                model="text-embedding-v2",
-                dashscope_api_key=self._embedding_api_key,
-            )
-            self._ensure_collection()
+            await self._connect()
             self._available = True
-            logger.info("LongTermMemory: Milvus connected at %s:%s", self._host, self._port)
+            logger.info(
+                "LongTermMemory: Milvus connected at %s:%s",
+                self._host,
+                self._port,
+            )
+            return
         except Exception as exc:
             logger.warning(
                 "LongTermMemory: Milvus unavailable (%s) – long-term memory disabled.", exc
@@ -145,6 +137,51 @@ class LongTermMemory:
         except Exception as exc:
             logger.error("LongTermMemory.save_memory failed: %s", exc)
     #这是一个便捷方法（Convenience Wrapper），用于保存用户的偏好设置到长期记忆中。
+    async def replace_memory(
+        self,
+        user_id: str,
+        content: str,
+        memory_type: str,
+    ) -> None:
+        """Replace memories of the same type for a user, then save the new value."""
+        if not self._available:
+            return
+        try:
+            safe_user = self._escape_filter_value(user_id)
+            safe_type = self._escape_filter_value(memory_type)
+            self._client.delete(
+                collection_name=COLLECTION_NAME,
+                filter=f'user_id == "{safe_user}" and memory_type == "{safe_type}"',
+            )
+        except Exception as exc:
+            logger.warning("LongTermMemory.replace_memory delete failed: %s", exc)
+        await self.save_memory(user_id, content, memory_type=memory_type)
+
+    async def list_memories(
+        self,
+        user_id: str,
+        *,
+        memory_types: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[str]:
+        """List memories by scalar fields, without vector search."""
+        if not self._available:
+            return []
+        try:
+            return self._list_memories(user_id, memory_types=memory_types, limit=limit)
+        except Exception as exc:
+            logger.warning(
+                "LongTermMemory.list_memories failed, retrying after reconnect: %s",
+                exc,
+            )
+            try:
+                await self._reconnect()
+                return self._list_memories(user_id, memory_types=memory_types, limit=limit)
+            except Exception as retry_exc:
+                self._available = False
+                logger.error("LongTermMemory.list_memories failed after reconnect: %s", retry_exc)
+                return []
+
     async def save_preference(
         self, user_id: str, preference_type: str, value: str
     ) -> None:
@@ -219,7 +256,24 @@ class LongTermMemory:
                     memories.append(hit["entity"]["content"])
             return memories
         except Exception as exc:
-            logger.error("LongTermMemory.retrieve_relevant failed: %s", exc)
+            logger.warning(
+                "LongTermMemory.retrieve_relevant failed, retrying after reconnect: %s",
+                exc,
+            )
+            try:
+                await self._reconnect()
+                results = await self._search_memories(user_id, query, top_k)
+                memories = []
+                for hits in results:
+                    for hit in hits:
+                        memories.append(hit["entity"]["content"])
+                return memories
+            except Exception as retry_exc:
+                self._available = False
+                logger.error(
+                    "LongTermMemory.retrieve_relevant failed after reconnect: %s",
+                    retry_exc,
+                )
             return []
 
     @property
@@ -230,6 +284,74 @@ class LongTermMemory:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _connect(self) -> None:
+        from pymilvus import MilvusClient  # type: ignore[import]
+        from langchain_community.embeddings import DashScopeEmbeddings  # type: ignore[import]
+
+        uri = f"http://{self._host}:{self._port}"
+        connect_kwargs: dict[str, Any] = {"uri": uri}
+        if self._api_key:
+            connect_kwargs["token"] = self._api_key
+
+        self._client = MilvusClient(**connect_kwargs)
+        logger.info("[Init] Milvus client created; verifying collection...")
+
+        if self._embeddings is None:
+            self._embeddings = DashScopeEmbeddings(
+                model="text-embedding-v2",
+                dashscope_api_key=self._embedding_api_key,
+            )
+            logger.info("[Init] Embedding model initialized")
+
+        self._ensure_collection()
+        logger.info("[Init] Milvus collection checked/created")
+
+    async def _reconnect(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+        self._client = None
+        await self._connect()
+        self._available = True
+
+    async def _search_memories(self, user_id: str, query: str, top_k: int) -> Any:
+        query_embedding = await self._embeddings.aembed_query(query)
+        return self._client.search(
+            collection_name=COLLECTION_NAME,
+            data=[query_embedding],
+            filter=f'user_id == "{user_id}"',
+            limit=top_k,
+            output_fields=["content", "memory_type"],
+        )
+
+    def _list_memories(
+        self,
+        user_id: str,
+        *,
+        memory_types: list[str] | None,
+        limit: int,
+    ) -> list[str]:
+        safe_user = self._escape_filter_value(user_id)
+        filter_expr = f'user_id == "{safe_user}"'
+        if memory_types:
+            safe_types = [self._escape_filter_value(item) for item in memory_types]
+            type_filter = " or ".join(f'memory_type == "{item}"' for item in safe_types)
+            filter_expr = f"{filter_expr} and ({type_filter})"
+
+        rows = self._client.query(
+            collection_name=COLLECTION_NAME,
+            filter=filter_expr,
+            output_fields=["content", "memory_type"],
+            limit=limit,
+        )
+        return [row["content"] for row in rows if row.get("content")]
+
+    @staticmethod
+    def _escape_filter_value(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
 
     def _ensure_collection(self) -> None:
         """Create the Milvus collection and index if they do not exist."""

@@ -5,8 +5,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from ..core.workflow.state import AgentState
 from typing import Dict, Any
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from .billing_agent import UserIdInjector
+from .mcp_client_cache import LazyMCPTools
 from ..tools.vector_tool import query_vector_db
 
 class RecommendationAgent:
@@ -28,22 +28,24 @@ class RecommendationAgent:
         config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'mcp_servers.json')
         with open(config_path, 'r', encoding='utf-8') as f:
             self.servers_config = json.load(f)
+        self._mcp_tools = LazyMCPTools(
+            self.servers_config.get("mcpServers", {}),
+            {"get_promotable_products", "search_product_catalog", "get_promotion_materials"},
+            interceptors_factory=lambda: [UserIdInjector()],
+        )
+
+    async def _ensure_tools(self):
+        return await self._mcp_tools.get_tools()
+
+    async def close(self):
+        await self._mcp_tools.close()
 
     async def __call__(self, state: AgentState) -> Dict[str, Any]:
         memory_context = state.get("memory_context", "")
         config = {"configurable": {"user_id": state.get("user_id", "unknown")}}
+        mcp_tools = await self._ensure_tools()
         
         # 获取 MCP 工具（用于拉取商品库）
-        client = MultiServerMCPClient(
-            connections=self.servers_config.get("mcpServers", {}),
-            tool_interceptors=[UserIdInjector()]
-        )
-        all_tools = await client.get_tools()
-        # 我们需要 search_product_catalog 和 get_promotable_products 来拉取商品
-        # 并引入 get_promotion_materials 获取最终的下单/推广链接
-        target_tools = ["get_promotable_products", "search_product_catalog", "get_promotion_materials"]
-        mcp_tools = [t for t in all_tools if t.name in target_tools]
-        
         # 组合向量工具与 MCP 工具
         tools = [query_vector_db] + mcp_tools
 

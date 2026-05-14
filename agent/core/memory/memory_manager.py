@@ -19,9 +19,11 @@ MemoryManager 是代理框架中所有内存操作的单一入口点。它委托
 """
 
 import logging
+import os
+import time
 from typing import Any
 
-from .short_term import ShortTermMemory
+from .short_term import COMPRESSION_THRESHOLD, SUMMARY_PREFIX, ShortTermMemory
 from .long_term import LongTermMemory
 from .preference_extractor import PreferenceExtractor
 
@@ -29,6 +31,26 @@ logger = logging.getLogger(__name__)
 
 _TOP_K_PREFERENCES = 20   # max preferences to retrieve per user
 _MAX_HISTORY_TURNS = 20   # max conversation turns used for extraction
+_RECENT_RAW_MESSAGES = 8
+_SUMMARY_MAX_INPUT_CHARS = 4000
+_RAW_MESSAGE_LIST_LIMIT = 32
+
+_SUMMARY_PROMPT_TEMPLATE = """\
+你是云客服系统的短期记忆压缩器。请把下面的历史对话压缩为一段中文会话摘要，供后续客服 Agent 继续理解上下文。
+
+要求：
+- 只保留对继续对话有用的信息，不要复述寒暄。
+- 重点保留用户目标、云产品、地域、实例/订单/工单/错误码、预算/规格/时间等约束。
+- 保留已经尝试过的排查步骤、已经给出的关键结论、仍未解决的问题。
+- 如果历史中有旧摘要，请把它和新对话合并为一份更新后的摘要。
+- 不要编造历史中没有的信息。
+- 控制在 200 字以内。
+
+历史内容：
+{conversation}
+
+更新后的会话摘要：
+"""
 
 
 class MemoryManager:
@@ -67,6 +89,8 @@ class MemoryManager:
         milvus_port: int = 19530,
         milvus_api_key: str | None = None,
         embedding_api_key: str | None = None,
+        memory_summary_model: str | None = None,
+        preference_extract_model: str | None = None,
     ) -> None:
         self.short_term = ShortTermMemory(redis_url=redis_url, ttl=redis_ttl)
         self.long_term = LongTermMemory(
@@ -75,6 +99,13 @@ class MemoryManager:
             api_key=milvus_api_key,
             embedding_api_key=embedding_api_key,
         )
+        self._summary_api_key = embedding_api_key
+        self._summary_model = memory_summary_model or os.getenv("MEMORY_SUMMARY_MODEL", "qwen-turbo")
+        self._preference_model = preference_extract_model or os.getenv(
+            "PREFERENCE_EXTRACT_MODEL", "qwen-turbo"
+        )
+        self._summary_llm: Any = None
+        self._preference_llm: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -128,14 +159,190 @@ class MemoryManager:
             messages: List of dicts with ``role`` and ``content`` keys.
         """
         non_system = [m for m in messages if m.get("role") != "system"]
-        # Append to existing history instead of overwriting
-        existing = await self.short_term.get_messages(user_id, session_id)
-        combined = existing + non_system
-        await self.short_term.save_messages(user_id, session_id, combined)
-        logger.debug(
-            "[MEMORY] Appended %d messages (total %d) for %s:%s",
-            len(non_system), len(combined), user_id, session_id,
+        stored_count = await self.short_term.append_messages(
+            user_id,
+            session_id,
+            non_system,
+            max_messages=_RAW_MESSAGE_LIST_LIMIT,
         )
+        await self._summarize_session_if_needed(user_id, session_id, stored_count)
+        logger.debug(
+            "[MEMORY] Appended %d messages (stored raw=%d) for %s:%s",
+            len(non_system), stored_count, user_id, session_id,
+        )
+
+    async def _summarize_session_if_needed(
+        self, user_id: str, session_id: str, raw_count: int
+    ) -> None:
+        """Compress older raw Redis List items into the rolling summary key."""
+        if raw_count <= COMPRESSION_THRESHOLD:
+            return
+
+        raw_messages = await self.short_term.get_raw_messages(user_id, session_id)
+        if len(raw_messages) <= COMPRESSION_THRESHOLD:
+            return
+
+        existing_summary = await self.short_term.get_summary(user_id, session_id)
+        recent = raw_messages[-_RECENT_RAW_MESSAGES:]
+        older = raw_messages[:-_RECENT_RAW_MESSAGES]
+        summary_inputs = self._summary_text_to_messages(existing_summary) + older
+
+        logger.info(
+            "[MEMORY] Short-term summary triggered for %s:%s (raw=%d, older=%d)",
+            user_id,
+            session_id,
+            len(raw_messages),
+            len(older),
+        )
+        self.short_term.record_event(
+            "memory_summary_triggered",
+            "success",
+            extra={
+                "raw_message_count": len(raw_messages),
+                "older_message_count": len(older),
+                "recent_message_count": len(recent),
+            },
+        )
+        start = time.perf_counter()
+        summary_text = await self._generate_summary(summary_inputs)
+        if not summary_text:
+            logger.warning("[MEMORY] Summary failed; falling back to recent messages only")
+            self.short_term.record_event(
+                "memory_summary_failed",
+                "fallback",
+                duration_ms=int((time.perf_counter() - start) * 1000),
+                fallback_used=True,
+                extra={"fallback_kept_messages": _RECENT_RAW_MESSAGES},
+            )
+            await self.short_term.trim_messages(user_id, session_id, _RECENT_RAW_MESSAGES)
+            return
+
+        await self.short_term.save_summary(user_id, session_id, summary_text)
+        await self.short_term.trim_messages(user_id, session_id, _RECENT_RAW_MESSAGES)
+        self.short_term.record_event(
+            "memory_summary_success",
+            "success",
+            duration_ms=int((time.perf_counter() - start) * 1000),
+            extra={
+                "summary_chars": len(summary_text),
+                "compressed_message_count": len(older),
+                "kept_message_count": len(recent),
+            },
+        )
+        logger.info(
+            "[MEMORY] Compressed %d older messages into short-term summary; kept %d recent messages",
+            len(older),
+            len(recent),
+        )
+
+    async def _generate_summary(self, messages: list[dict[str, Any]]) -> str | None:
+        conversation = self._format_messages_for_summary(messages)
+        if not conversation:
+            return None
+
+        llm = self._get_summary_llm()
+        if llm is None:
+            return None
+
+        prompt = _SUMMARY_PROMPT_TEMPLATE.format(
+            conversation=conversation[:_SUMMARY_MAX_INPUT_CHARS]
+        )
+        try:
+            response = await llm.ainvoke([{"role": "user", "content": prompt}])
+            summary = getattr(response, "content", str(response)).strip()
+        except Exception as exc:
+            logger.warning("[MEMORY] Short-term summary LLM call failed: %s", exc)
+            return None
+
+        if not summary:
+            return None
+        return summary.replace(SUMMARY_PREFIX, "").strip()
+
+    def _get_summary_llm(self) -> Any | None:
+        if self._summary_llm is not None:
+            return self._summary_llm
+
+        api_key = self._summary_api_key or os.getenv("DASHSCOPE_API_KEY")
+        if not api_key:
+            logger.warning("[MEMORY] DASHSCOPE_API_KEY missing; short-term summary disabled")
+            return None
+
+        try:
+            from langchain_openai import ChatOpenAI
+
+            self._summary_llm = ChatOpenAI(
+                api_key=api_key,
+                model=self._summary_model,
+                base_url=os.getenv(
+                    "BASE_URL",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+                temperature=0.1,
+            )
+            return self._summary_llm
+        except Exception as exc:
+            logger.warning("[MEMORY] Failed to initialize summary LLM: %s", exc)
+            return None
+
+    def _get_preference_llm(self) -> Any | None:
+        if self._preference_llm is not None:
+            return self._preference_llm
+
+        api_key = self._summary_api_key or os.getenv("DASHSCOPE_API_KEY")
+        if not api_key:
+            logger.warning("[MEMORY] DASHSCOPE_API_KEY missing; preference extraction disabled")
+            return None
+
+        try:
+            from langchain_openai import ChatOpenAI
+
+            self._preference_llm = ChatOpenAI(
+                api_key=api_key,
+                model=self._preference_model,
+                base_url=os.getenv(
+                    "BASE_URL",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+                temperature=0.1,
+            )
+            return self._preference_llm
+        except Exception as exc:
+            logger.warning("[MEMORY] Failed to initialize preference extraction LLM: %s", exc)
+            return None
+
+    @staticmethod
+    def _is_summary_message(message: dict[str, Any]) -> bool:
+        return (
+            message.get("role") == "system"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith(SUMMARY_PREFIX)
+        )
+
+    @staticmethod
+    def _summary_text_to_messages(summary: str | None) -> list[dict[str, Any]]:
+        if not summary:
+            return []
+        return [{"role": "system", "content": f"{SUMMARY_PREFIX}\n{summary}"}]
+
+    @staticmethod
+    def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            role = message.get("role", "unknown")
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system" and content.startswith(SUMMARY_PREFIX):
+                role_label = "已有摘要"
+                content = content.removeprefix(SUMMARY_PREFIX).strip()
+            elif role == "user":
+                role_label = "用户"
+            elif role == "assistant":
+                role_label = "助手"
+            else:
+                role_label = str(role)
+            lines.append(f"{role_label}: {content}")
+        return "\n".join(lines)
 #get_recent_messages(user_id, session_id): 从 Redis 读取最近的对话历史，供 Agent 生成回复时使用。
     async def get_recent_messages(
         self, user_id: str, session_id: str
@@ -207,7 +414,7 @@ class MemoryManager:
         await self.long_term.save_preference(user_id, preference_type, value)
  #background_extract(user_id, session_id, llm): 在会话进行中后台静默运行，利用 LLM 从当前对话中提取新偏好并存入 Milvus，不中断会话。
     async def background_extract(
-        self, user_id: str, session_id: str, llm: Any
+        self, user_id: str, session_id: str, llm: Any | None = None
     ) -> list[str]:
         """Silently extract and save preferences without clearing Redis.
     
@@ -229,6 +436,11 @@ class MemoryManager:
         messages = await self.short_term.get_messages(user_id, session_id)
         if len(messages) < 4:  # need at least 2 full turns
             return
+
+        preference_llm = self._get_preference_llm()
+        if preference_llm is None:
+            logger.warning("[MEMORY] Preference extraction skipped: LLM unavailable")
+            return []
     
         recent = messages[-_MAX_HISTORY_TURNS:]
         conversation_text = "\n".join(
@@ -236,7 +448,7 @@ class MemoryManager:
         )
     
         try:
-            extractor = PreferenceExtractor(llm=llm)
+            extractor = PreferenceExtractor(llm=preference_llm)
             existing = await self.load_preferences(user_id)
             new_items = await extractor.extract(
                 conversation_text=conversation_text,
@@ -273,7 +485,7 @@ class MemoryManager:
     2.去重后存入 Milvus（长期记忆）。
     3.清空 Redis 中的短期对话记录，释放空间。"""
     async def finalize_session(
-        self, user_id: str, session_id: str, llm: Any
+        self, user_id: str, session_id: str, llm: Any | None = None
     ) -> None:
         """Finalize a session: extract preferences then clean up.
 
@@ -317,7 +529,13 @@ class MemoryManager:
 
         # 3. Extract preferences (LLM call)
         if self.long_term.available:
-            extractor = PreferenceExtractor(llm=llm)
+            preference_llm = self._get_preference_llm()
+            if preference_llm is None:
+                logger.warning("[MEMORY] Preference extraction skipped: LLM unavailable")
+                await self.short_term.clear(user_id, session_id)
+                return
+
+            extractor = PreferenceExtractor(llm=preference_llm)
             existing = await self.load_preferences(user_id)
             logger.debug(
                 "[MEMORY] Existing preferences (%d) for dedup: %s",

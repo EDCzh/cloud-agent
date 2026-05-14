@@ -6,8 +6,34 @@ import time
 import requests
 import sys
 from decimal import Decimal
+from dbutils.pooled_db import PooledDB
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
+
+try:
+    from agent.core.resilience import (
+        ErrorCode,
+        ToolStatus,
+        classify_exception,
+        log_dependency_event,
+        make_error_result,
+        make_success_result,
+        result_to_json,
+    )
+    from agent.core.resilience.result import classify_http_status
+except ModuleNotFoundError:
+    from core.resilience import (
+        ErrorCode,
+        ToolStatus,
+        classify_exception,
+        log_dependency_event,
+        make_error_result,
+        make_success_result,
+        result_to_json,
+    )
+    from core.resilience.result import classify_http_status
 
 # ==============================================================================
 # 初始化环境配置
@@ -22,18 +48,122 @@ load_dotenv(dotenv_path)
 # ==============================================================================
 mcp = FastMCP("CloudPlatformMCPServer")
 
+_http_session = None
+
+
+def get_http_session():
+    global _http_session
+    if _http_session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=1,
+            connect=1,
+            read=1,
+            status=1,
+            backoff_factor=0.3,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _http_session = session
+    return _http_session
+
+
+def close_http_session():
+    global _http_session
+    if _http_session is not None:
+        _http_session.close()
+        _http_session = None
+
 # ==============================================================================
 # 数据库连接辅助函数
 # ==============================================================================
-def get_db_connection():
-    """获取远程 MySQL 连接。在生产环境中应使用连接池。"""
-    return pymysql.connect(
+_mysql_pool = None
+
+
+def _get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _create_mysql_pool():
+    return PooledDB(
+        creator=pymysql,
+        mincached=_get_env_int("MYSQL_POOL_MINCACHED", 1),
+        maxcached=_get_env_int("MYSQL_POOL_MAXCACHED", 5),
+        maxconnections=_get_env_int("MYSQL_POOL_MAXCONNECTIONS", 10),
+        blocking=os.getenv("MYSQL_POOL_BLOCKING", "true").lower() == "true",
+        ping=_get_env_int("MYSQL_POOL_PING", 1),
         host=os.getenv("MYSQL_HOST", "YOUR_MYSQL_HOST"),
-        port=int(os.getenv("MYSQL_PORT", 3306)),
+        port=_get_env_int("MYSQL_PORT", 3306),
         user=os.getenv("MYSQL_USER", "root"),
         password=os.getenv("MYSQL_PASSWORD", "YOUR_MYSQL_PASSWORD"),
         database=os.getenv("MYSQL_DATABASE", "cloud_platform"),
-        cursorclass=pymysql.cursors.DictCursor # 让查询结果以字典形式返回，方便转 JSON
+        charset=os.getenv("MYSQL_CHARSET", "utf8mb4"),
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=os.getenv("MYSQL_AUTOCOMMIT", "true").lower() == "true",
+        connect_timeout=_get_env_int("MYSQL_CONNECT_TIMEOUT", 3),
+        read_timeout=_get_env_int("MYSQL_READ_TIMEOUT", 10),
+        write_timeout=_get_env_int("MYSQL_WRITE_TIMEOUT", 10),
+    )##ping=1: 连接健康检查策略，值为1表示每次获取连接时都检测连接有效性
+     ##blocking=true: 当连接池满时是否阻塞等待。设为true时，新请求会等待直到有连接释放；false则立即抛出异常
+
+
+def get_mysql_pool():
+    global _mysql_pool
+    if _mysql_pool is None:
+        _mysql_pool = _create_mysql_pool()
+    return _mysql_pool
+
+
+def close_mysql_pool():
+    global _mysql_pool
+    if _mysql_pool is not None:
+        _mysql_pool.close()
+        _mysql_pool = None
+
+
+def get_db_connection():
+    """Get a MySQL connection from the shared pool."""
+    return get_mysql_pool().connection()
+
+
+def close_db_connection(connection):
+    """Return a DBUtils connection to the pool if it was acquired."""
+    if connection is not None:
+        connection.close()
+
+
+def _success_json(tool_name, data=None, message="", status=ToolStatus.SUCCESS, fallback=None, meta=None):
+    return result_to_json(
+        make_success_result(
+            tool_name=tool_name,
+            data=data,
+            message=message,
+            status=status,
+            fallback=fallback,
+            meta=meta,
+        )
+    )
+
+
+def _error_json(tool_name, code, message, detail="", fallback=None, data=None, meta=None, status=ToolStatus.ERROR):
+    return result_to_json(
+        make_error_result(
+            tool_name=tool_name,
+            code=code,
+            message=message,
+            detail=detail,
+            fallback=fallback,
+            data=data,
+            meta=meta,
+            status=status,
+        )
     )
 
 # ==============================================================================
@@ -84,7 +214,13 @@ def get_promotable_products() -> str:
                 "product_name": pinfo["name"],
                 "price": pinfo["price"]
             })
-            
+
+    return _success_json(
+        "get_promotable_products",
+        data=promotable_list,
+        message="已获取当前可推广商品列表。",
+    )
+
     return json.dumps({
         "status": "success",
         "message": "为您找到以下可推广的商品列表：",
@@ -99,6 +235,28 @@ def search_product_catalog(keyword: str) -> str:
     Args:
         keyword: 用户描述的产品关键词。
     """
+    normalized_results = []
+    kw_lower = keyword.lower()
+    for pid, pinfo in PRODUCT_CATALOG.items():
+        if kw_lower in pinfo["name"].lower() or any(kw_lower in k for k in pinfo["keywords"]):
+            normalized_results.append({
+                "product_id": pid,
+                "product_name": pinfo["name"],
+                "price": pinfo["price"],
+            })
+
+    if not normalized_results:
+        return _error_json(
+            "search_product_catalog",
+            ErrorCode.NOT_FOUND,
+            f"未找到精确匹配 '{keyword}' 的产品，已提供通用活动作为兜底选择。",
+            data={"recommendation": {"product_id": "P_ALL_000", "product_name": "全场通用云产品活动"}},
+            fallback={"used": True, "source": "static", "reason": "product_not_found"},
+            status=ToolStatus.FALLBACK,
+        )
+
+    return _success_json("search_product_catalog", data=normalized_results, message="已获取匹配商品。")
+
     results = []
     kw_lower = keyword.lower()
     
@@ -180,7 +338,11 @@ def get_promotion_materials(product_id: str, user_id: str = "") -> str:
             "commission_rate": promo["commission_rate"]
         }
     }
-    return json.dumps(result, ensure_ascii=False)
+    return _success_json(
+        "get_promotion_materials",
+        data=result["data"],
+        message="已获取推广物料。",
+    )
 
 @mcp.tool()
 def generate_ai_poster(prompt: str) -> str:
@@ -192,6 +354,14 @@ def generate_ai_poster(prompt: str) -> str:
     """
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
+        return _error_json(
+            "generate_ai_poster",
+            ErrorCode.VALIDATION_ERROR,
+            "海报生成暂不可用，请先使用推广链接和文案完成分享。",
+            detail="DASHSCOPE_API_KEY is not configured",
+            fallback={"used": True, "source": "partial_result", "reason": "missing_api_key"},
+            status=ToolStatus.FALLBACK,
+        )
         return json.dumps({"status": "error", "message": "未配置 DASHSCOPE_API_KEY"}, ensure_ascii=False)
 
     url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
@@ -218,10 +388,12 @@ def generate_ai_poster(prompt: str) -> str:
     }
 
     last_error = "生成失败"
+    last_error_code = ErrorCode.UNKNOWN
+    start = time.perf_counter()
     for attempt in range(1, 3):
         try:
             sys.stderr.write(f"[AI-POSTER][QWEN] attempt={attempt} submit start\n")
-            res = requests.post(url, json=payload, headers=headers, timeout=120)
+            res = get_http_session().post(url, json=payload, headers=headers, timeout=120)
             data = res.json()
             request_id = data.get("request_id", "")
             sys.stderr.write(f"[AI-POSTER][QWEN] attempt={attempt} status={res.status_code} request_id={request_id}\n")
@@ -235,6 +407,20 @@ def generate_ai_poster(prompt: str) -> str:
             )
             if res.status_code == 200 and image_url:
                 sys.stderr.write(f"[AI-POSTER][QWEN] attempt={attempt} success\n")
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                log_dependency_event(
+                    dependency="dashscope",
+                    operation="generate_ai_poster",
+                    status="success",
+                    duration_ms=duration_ms,
+                    attempts=attempt,
+                )
+                return _success_json(
+                    "generate_ai_poster",
+                    data={"poster_url": image_url, "request_id": request_id},
+                    message="海报生成成功。",
+                    meta={"duration_ms": duration_ms, "attempts": attempt, "request_id": request_id},
+                )
                 return json.dumps({
                     "status": "success",
                     "data": {
@@ -245,10 +431,54 @@ def generate_ai_poster(prompt: str) -> str:
                 }, ensure_ascii=False)
 
             last_error = data.get("message") or data.get("code") or f"HTTP {res.status_code}"
+            last_error_code = classify_http_status(res.status_code)
             sys.stderr.write(f"[AI-POSTER][QWEN] attempt={attempt} failed: {last_error}\n")
+            if attempt == 2 or last_error_code != ErrorCode.HTTP_5XX:
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                log_dependency_event(
+                    dependency="dashscope",
+                    operation="generate_ai_poster",
+                    status="fallback",
+                    duration_ms=duration_ms,
+                    attempts=attempt,
+                    error_code=last_error_code.value,
+                    fallback_used=True,
+                    detail=last_error,
+                )
+                return _error_json(
+                    "generate_ai_poster",
+                    last_error_code,
+                    "海报暂时没有生成成功，已保留推广链接和卖点文案，可稍后重试生成海报。",
+                    detail=last_error,
+                    fallback={"used": True, "source": "partial_result", "reason": "poster_generation_failed"},
+                    meta={"duration_ms": duration_ms, "attempts": attempt},
+                    status=ToolStatus.FALLBACK,
+                )
         except Exception as e:
             last_error = str(e)
+            last_error_code = classify_exception(e)
             sys.stderr.write(f"[AI-POSTER][QWEN] attempt={attempt} exception: {last_error}\n")
+            if attempt == 2 or last_error_code not in {ErrorCode.TIMEOUT, ErrorCode.NETWORK_ERROR}:
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                log_dependency_event(
+                    dependency="dashscope",
+                    operation="generate_ai_poster",
+                    status="fallback",
+                    duration_ms=duration_ms,
+                    attempts=attempt,
+                    error_code=last_error_code.value,
+                    fallback_used=True,
+                    detail=last_error,
+                )
+                return _error_json(
+                    "generate_ai_poster",
+                    last_error_code,
+                    "海报暂时没有生成成功，已保留推广链接和卖点文案，可稍后重试生成海报。",
+                    detail=last_error,
+                    fallback={"used": True, "source": "partial_result", "reason": "poster_generation_failed"},
+                    meta={"duration_ms": duration_ms, "attempts": attempt},
+                    status=ToolStatus.FALLBACK,
+                )
 
     return json.dumps({"status": "error", "message": f"Qwen-Image 生成失败: {last_error}"}, ensure_ascii=False)
 
@@ -281,6 +511,8 @@ Cursor 是数据库连接的执行上下文，类似于文件操作中的"文件
             """
             cursor.execute(sql, (user_id, limit))
             results = cursor.fetchall()
+            if not results:
+                return _success_json("query_user_orders", data=[], message="当前没有查询到订单记录。")
             
             if not results:
                 return json.dumps({"status": "success", "message": "该用户目前没有任何订单记录。"}, ensure_ascii=False)
@@ -289,12 +521,20 @@ Cursor 是数据库连接的执行上下文，类似于文件操作中的"文件
                 if 'amount' in row and row['amount'] is not None:
                     row['amount'] = float(row['amount'])
                     
-            return json.dumps({"status": "success", "data": results}, ensure_ascii=False)
+            return _success_json("query_user_orders", data=results, message="已获取订单记录。")
     except Exception as e:
+        code = classify_exception(e)
+        return _error_json(
+            "query_user_orders",
+            code,
+            "订单数据暂时没有查询成功，可稍后重试或联系人工支持。",
+            detail=str(e),
+            fallback={"used": True, "source": "manual_support", "reason": "database_query_failed"},
+            status=ToolStatus.FALLBACK,
+        )
         return json.dumps({"status": "error", "message": f"查询数据库失败: {str(e)}"}, ensure_ascii=False)
     finally:
-        if 'connection' in locals() and connection.open:
-            connection.close()
+        close_db_connection(locals().get("connection"))
 
 @mcp.tool()
 def query_user_instances(user_id: str, limit: int = 5) -> str:
@@ -315,17 +555,27 @@ def query_user_instances(user_id: str, limit: int = 5) -> str:
         with connection.cursor() as cursor:
             cursor.execute(sql, (user_id, limit))
             result = cursor.fetchall()
+            if not result:
+                return _success_json("query_user_instances", data=[], message="当前没有查询到服务器实例数据。")
             
             if not result:
                 return json.dumps({"status": "success", "message": f"未查询到您的服务器实例数据。"}, ensure_ascii=False)
             
-            return json.dumps({"status": "success", "data": result}, ensure_ascii=False)
+            return _success_json("query_user_instances", data=result, message="已获取服务器实例数据。")
             
     except Exception as e:
+        code = classify_exception(e)
+        return _error_json(
+            "query_user_instances",
+            code,
+            "实例数据暂时没有查询成功，可稍后重试或联系人工支持。",
+            detail=str(e),
+            fallback={"used": True, "source": "manual_support", "reason": "database_query_failed"},
+            status=ToolStatus.FALLBACK,
+        )
         return json.dumps({"status": "error", "message": f"查询数据库失败: {str(e)}"}, ensure_ascii=False)
     finally:
-        if 'connection' in locals() and connection.open:
-            connection.close()
+        close_db_connection(locals().get("connection"))
 
 @mcp.tool()
 def analyze_instance_usage(instance_id: str, user_id: str = "") -> str:
@@ -338,6 +588,12 @@ def analyze_instance_usage(instance_id: str, user_id: str = "") -> str:
         user_id: [系统注入] 当前用户的ID，用于安全鉴权，防止越权查询他人监控数据。
     """
     if not instance_id:
+        return _error_json(
+            "analyze_instance_usage",
+            ErrorCode.VALIDATION_ERROR,
+            "必须提供实例 ID 后才能分析资源使用情况。",
+            detail="instance_id is empty",
+        )
         return json.dumps({"status": "error", "message": "必须提供实例 ID (instance_id)"}, ensure_ascii=False)
     
     try:
@@ -352,6 +608,12 @@ def analyze_instance_usage(instance_id: str, user_id: str = "") -> str:
             cursor.execute(auth_sql, (instance_id, user_id))
             owned_instance = cursor.fetchone()
             if not owned_instance:
+                return _error_json(
+                    "analyze_instance_usage",
+                    ErrorCode.PERMISSION_DENIED,
+                    "未找到该实例，或当前账号无权查看该实例监控数据。",
+                    detail="instance ownership check failed",
+                )
                 return json.dumps({"status": "error", "message": "未找到该实例，或您无权查看该实例监控数据。"}, ensure_ascii=False)
 
             metrics_sql= """
@@ -369,6 +631,14 @@ def analyze_instance_usage(instance_id: str, user_id: str = "") -> str:
             agg = cursor.fetchone()
 
             if not agg or not agg.get("days_count"):
+                return _error_json(
+                    "analyze_instance_usage",
+                    ErrorCode.NOT_FOUND,
+                    "未查询到该实例近 7 天监控数据，可稍后重试或选择其他实例。",
+                    detail="metrics not found",
+                    fallback={"used": True, "source": "partial_result", "reason": "metrics_not_found"},
+                    status=ToolStatus.FALLBACK,
+                )
                 return json.dumps({"status": "error", "message": "未查询到该实例近7天监控数据，请稍后再试。"}, ensure_ascii=False)
 
             cpu = float(agg["cpu_usage_percent"] or 0)
@@ -392,12 +662,20 @@ def analyze_instance_usage(instance_id: str, user_id: str = "") -> str:
                 },
                 "diagnosis": diagnosis
             }
-            return json.dumps({"status": "success", "data": result}, ensure_ascii=False)
+            return _success_json("analyze_instance_usage", data=result, message="已获取实例近 7 天资源使用分析。")
     except Exception as e:
+        code = classify_exception(e)
+        return _error_json(
+            "analyze_instance_usage",
+            code,
+            "监控数据暂时没有查询成功，可稍后重试或联系人工支持。",
+            detail=str(e),
+            fallback={"used": True, "source": "manual_support", "reason": "database_query_failed"},
+            status=ToolStatus.FALLBACK,
+        )
         return json.dumps({"status": "error", "message": f"查询监控数据失败: {str(e)}"}, ensure_ascii=False)
     finally:
-        if 'connection' in locals() and connection.open:
-            connection.close()
+        close_db_connection(locals().get("connection"))
 
 # @mcp.tool()
 # def get_promotion_materials(product_name: str, user_id: str = "") -> str:

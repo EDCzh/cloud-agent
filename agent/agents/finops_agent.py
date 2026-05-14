@@ -3,11 +3,11 @@ import json
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from typing import Dict, Any
 
 from ..core.workflow.state import AgentState
 from .billing_agent import UserIdInjector
+from .mcp_client_cache import LazyMCPTools
 
 class FinOpsAgentNode:
     """
@@ -28,20 +28,22 @@ class FinOpsAgentNode:
         config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'mcp_servers.json')
         with open(config_path, 'r', encoding='utf-8') as f:
             self.servers_config = json.load(f)
+        self._mcp_tools = LazyMCPTools(
+            self.servers_config.get("mcpServers", {}),
+            {"query_user_instances", "analyze_instance_usage"},
+            interceptors_factory=lambda: [UserIdInjector()],
+        )
 
     async def _ensure_tools(self):
-        pass
+        return await self._mcp_tools.get_tools()
+
+    async def close(self):
+        await self._mcp_tools.close()
 
     async def __call__(self, state: AgentState) -> Dict[str, Any]:
         config = {"configurable": {"user_id": state.get("user_id", "unknown")}}
 
-        client = MultiServerMCPClient(
-            connections=self.servers_config.get("mcpServers", {}),
-            tool_interceptors=[UserIdInjector()]
-        )
-        all_tools = await client.get_tools()
-        target_tools = ["query_user_instances", "analyze_instance_usage"]
-        tools = [t for t in all_tools if t.name in target_tools]
+        tools = await self._ensure_tools()
         
         system_prompt = f"""你是一个专业的云上【FinOps成本优化专家】。
 你刚刚接手了上一个 Agent (BillingAgent) 传递过来的上下文。

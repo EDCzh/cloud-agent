@@ -7,6 +7,15 @@ from langchain_neo4j import GraphCypherQAChain
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import tool
 
+from agent.core.resilience import (
+    ToolStatus,
+    classify_exception,
+    log_dependency_event,
+    make_error_result,
+    make_success_result,
+    result_to_json,
+)
+
 # 加载环境变量
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
 load_dotenv(dotenv_path)
@@ -137,10 +146,24 @@ def _fallback_graph_keyword_search(query: str) -> str:
         nodes = graph.query(node_cypher)
         relations = graph.query(rel_cypher)
     except Exception as exc:
-        return f"图谱关键词检索失败: {str(exc)}"
+        return result_to_json(
+            make_error_result(
+                tool_name="query_knowledge_graph_fallback",
+                code=classify_exception(exc),
+                message="图谱关键词检索失败。",
+                detail=str(exc),
+            )
+        )
 
     if not nodes and not relations:
-        return "未查询到相关图谱信息。"
+        return result_to_json(
+            make_success_result(
+                tool_name="query_knowledge_graph_fallback",
+                data={"answer": "未查询到相关图谱信息。"},
+                message="未找到匹配的节点或关系。",
+                status=ToolStatus.PARTIAL,
+            )
+        )
 
     parts = ["图谱关键词检索结果："]
     if nodes:
@@ -156,7 +179,14 @@ def _fallback_graph_keyword_search(query: str) -> str:
             from_labels = ",".join(row.get("from_labels", []))
             to_labels = ",".join(row.get("to_labels", []))
             parts.append(f"- [{from_labels}] {row.get('from_node', '')} -[{row.get('rel', '')}]-> [{to_labels}] {row.get('to_node', '')}")
-    return "\n".join(parts)
+    
+    return result_to_json(
+        make_success_result(
+            tool_name="query_knowledge_graph_fallback",
+            data={"answer": "\n".join(parts)},
+            message="图谱关键词检索完成。",
+        )
+    )
 
 @tool
 def query_knowledge_graph(query: str) -> str:
@@ -168,9 +198,54 @@ def query_knowledge_graph(query: str) -> str:
     try:
         chain = _get_graph_chain()
         result = chain.invoke({"query": query})
+        answer = result.get("result", "未找到相关图谱信息。")
+        return result_to_json(
+            make_success_result(
+                tool_name="query_knowledge_graph",
+                data={"answer": answer},
+                message="已完成图谱检索。",
+            )
+        )
         return result.get('result', "未找到相关图谱信息。")
     except Exception as e:
         fallback_result = _fallback_graph_keyword_search(query)
+        if fallback_result:
+            code = classify_exception(e)
+            log_dependency_event(
+                dependency="neo4j",
+                operation="query_knowledge_graph",
+                status="fallback",
+                error_code=code.value,
+                fallback_used=True,
+                detail=str(e),
+            )
+            return result_to_json(
+                make_success_result(
+                    tool_name="query_knowledge_graph",
+                    data={"answer": fallback_result},
+                    message="图谱主查询未成功，已使用关键词检索兜底。",
+                    status=ToolStatus.FALLBACK,
+                    fallback={"used": True, "source": "keyword_graph_search", "reason": "graph_chain_failed"},
+                )
+            )
         if fallback_result and "失败" not in fallback_result:
-            return fallback_result
-        return f"查询图谱时发生错误: {str(e)}；关键词兜底结果：{fallback_result}"
+            return result_to_json(
+                make_success_result(
+                    tool_name="query_knowledge_graph",
+                    data={"answer": fallback_result, "source": "keyword_fallback"},
+                    message="图谱主查询失败，已使用关键词检索兜底。",
+                    status=ToolStatus.FALLBACK,
+                    fallback={"used": True, "source": "keyword_graph_search", "reason": "graph_chain_failed"},
+                )
+            )
+        return result_to_json(
+            make_error_result(
+                tool_name="query_knowledge_graph",
+                code=classify_exception(e),
+                message="图谱查询失败，关键词兜底也未成功。",
+                detail=str(e),
+                data={"fallback_answer": fallback_result},
+                fallback={"used": True, "source": "keyword_graph_search", "reason": "both_failed"},
+                status=ToolStatus.ERROR,
+            )
+        )

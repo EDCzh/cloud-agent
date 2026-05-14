@@ -189,6 +189,8 @@ async def main() -> None:
         milvus_port=settings.milvus_port,
         milvus_api_key=settings.milvus_api_key,
         embedding_api_key=settings.dashscope_api_key,
+        memory_summary_model=settings.memory_summary_model,
+        preference_extract_model=settings.preference_extract_model,
     )
     await memory.initialize()
     

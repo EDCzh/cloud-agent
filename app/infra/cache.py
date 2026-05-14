@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app_config.settings import settings
@@ -10,6 +11,25 @@ from app_config.settings import settings
 COLLECTION_NAME = "qa_semantic_cache"
 EMBEDDING_DIM = 1536    #向量维度
 L1_SEMANTIC_DISTANCE_THRESHOLD = 0.08  #语义相似度阈值
+
+UNCACHEABLE_ANSWER_MARKERS = (
+    "这次查询没有完整完成",
+    "建议稍后重试",
+    "转人工",
+    "输入的内容似乎是一串问号",
+    "可能发送时出现了乱码",
+    "未表达清楚问题",
+)
+
+
+def _debug_cache_event(event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    print("[SEMANTIC_CACHE_DEBUG] " + json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _is_usable_cached_answer(answer: str) -> bool:
+    return not any(marker in answer for marker in UNCACHEABLE_ANSWER_MARKERS)
+
 
 class SemanticCache:
     def __init__(self) -> None:
@@ -50,6 +70,9 @@ class SemanticCache:
             return
         #标准化文本
         normalized = self._normalize(query)
+        if not normalized or normalized.count("?") >= max(3, len(normalized) // 2):
+            _debug_cache_event("skip_set_garbled_query", query=query, user_id=user_id)
+            return
         owner = user_id or ""
         #cache_scope: 最终存入数据库的作用域字段
         cache_scope = "user" if owner else scope
@@ -86,10 +109,18 @@ class SemanticCache:
 
     async def get_cache(self, query: str, user_id: str) -> dict[str, Any] | None:
         if not self._available:
+            _debug_cache_event("skip_unavailable", query=query, user_id=user_id)
             return None
         normalized = self._normalize(query)
         safe_norm = normalized.replace('"', '\\"')
         safe_user = user_id.replace('"', '\\"')
+        _debug_cache_event(
+            "lookup_start",
+            query=query,
+            normalized=normalized,
+            user_id=user_id,
+            threshold=L1_SEMANTIC_DISTANCE_THRESHOLD,
+        )
 
         user_filter = (
             f'enabled == 1 and question_norm == "{safe_norm}" and scope == "user" and user_id == "{safe_user}"'
@@ -100,6 +131,14 @@ class SemanticCache:
         #用户私有精确匹配
         user_exact = self._query_one(user_filter)
         if user_exact:
+            _debug_cache_event(
+                "hit_exact_user",
+                query=query,
+                user_id=user_id,
+                matched_question=user_exact.get("question"),
+                scope=user_exact.get("scope"),
+                owner=user_exact.get("user_id"),
+            )
             return {
                 "answer": user_exact["answer"],
                 "matched_question": user_exact["question"],
@@ -109,6 +148,14 @@ class SemanticCache:
         #公共精确匹配
         public_exact = self._query_one(public_filter)
         if public_exact:
+            _debug_cache_event(
+                "hit_exact_public",
+                query=query,
+                user_id=user_id,
+                matched_question=public_exact.get("question"),
+                scope=public_exact.get("scope"),
+                owner=public_exact.get("user_id"),
+            )
             return {
                 "answer": public_exact["answer"],
                 "matched_question": public_exact["question"],
@@ -147,21 +194,52 @@ class SemanticCache:
                 output_fields=["question", "answer", "scope", "user_id"],
             )
             if not results:
+                _debug_cache_event("miss_semantic_no_results", query=query, user_id=user_id)
                 return None
             hit = results[0][0] if results[0] else None
             if not hit:
+                _debug_cache_event("miss_semantic_empty_hits", query=query, user_id=user_id)
                 return None
             distance = float(hit.get("distance", 1.0))
-            if distance > L1_SEMANTIC_DISTANCE_THRESHOLD:
-                return None
             entity = hit.get("entity", {})
+            answer = entity.get("answer", "")
+            _debug_cache_event(
+                "semantic_top_hit",
+                query=query,
+                user_id=user_id,
+                matched_question=entity.get("question", ""),
+                scope=entity.get("scope", ""),
+                owner=entity.get("user_id", ""),
+                distance=distance,
+                threshold=L1_SEMANTIC_DISTANCE_THRESHOLD,
+                accepted=distance <= L1_SEMANTIC_DISTANCE_THRESHOLD,
+            )
+            if not _is_usable_cached_answer(answer):
+                _debug_cache_event(
+                    "miss_semantic_uncacheable_answer",
+                    query=query,
+                    user_id=user_id,
+                    matched_question=entity.get("question", ""),
+                    distance=distance,
+                )
+                return None
+            if distance > L1_SEMANTIC_DISTANCE_THRESHOLD:
+                _debug_cache_event(
+                    "miss_semantic_threshold",
+                    query=query,
+                    user_id=user_id,
+                    distance=distance,
+                    threshold=L1_SEMANTIC_DISTANCE_THRESHOLD,
+                )
+                return None
             return {
-                "answer": entity.get("answer", ""),
+                "answer": answer,
                 "matched_question": entity.get("question", ""),
                 "level": "L1_SEMANTIC", # 标记为语义匹配
                 "distance": distance,
             }
         except Exception as exc:
+            _debug_cache_event("lookup_error", query=query, user_id=user_id, error=str(exc))
             print(f"SemanticCache get_cache failed: {exc}")
             return None
 

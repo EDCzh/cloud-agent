@@ -6,6 +6,15 @@ from langchain_milvus import Milvus
 from pymilvus import connections
 from langchain_core.tools import tool
 
+from agent.core.resilience import (
+    ToolStatus,
+    classify_exception,
+    log_dependency_event,
+    make_error_result,
+    make_success_result,
+    result_to_json,
+)
+
 # ==============================================================================
 # 修复 pymilvus 2.6.x 与 langchain-milvus 0.3.x 之间的兼容性问题
 #这段代码实现了一个**“猴子补丁”（Monkey Patch），用于修复 pymilvus（Milvus 的 Python 客户端库）在特定版本或复杂环境下可能出现的连接获取失败**问题。
@@ -95,6 +104,14 @@ def query_vector_db(query: str) -> str:
 ]"""
         
         if not results:
+            return result_to_json(
+                make_success_result(
+                    tool_name="query_vector_db",
+                    data={"documents": []},
+                    message="未在文档中检索到相关信息。",
+                    status=ToolStatus.PARTIAL,
+                )
+            )
             return "未在文档中检索到相关信息。"
 
         formatted_results = []
@@ -104,6 +121,32 @@ def query_vector_db(query: str) -> str:
             content = doc.page_content.strip()
             formatted_results.append(f"【来源: {source}】\n{content}")
             
-        return "\n\n".join(formatted_results)
+        answer = "\n\n".join(formatted_results)
+        return result_to_json(
+            make_success_result(
+                tool_name="query_vector_db",
+                data={"answer": answer, "documents": formatted_results},
+                message="已完成向量检索。",
+            )
+        )
     except Exception as e:
+        code = classify_exception(e)
+        log_dependency_event(
+            dependency="milvus",
+            operation="query_vector_db",
+            status="fallback",
+            error_code=code.value,
+            fallback_used=True,
+            detail=str(e),
+        )
+        return result_to_json(
+            make_error_result(
+                tool_name="query_vector_db",
+                code=code,
+                message="向量知识库暂时没有检索成功，可基于其他可用知识源继续回答。",
+                detail=str(e),
+                fallback={"used": True, "source": "alternate_tool_or_static", "reason": "vector_search_failed"},
+                status=ToolStatus.FALLBACK,
+            )
+        )
         return f"查询向量数据库时发生错误: {str(e)}"

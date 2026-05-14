@@ -4,10 +4,10 @@ import asyncio
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import ToolCallInterceptor, MCPToolCallRequest, MCPToolCallResult
 from typing import Callable, Awaitable, Dict, Any
 from agent.core.workflow.state import AgentState
+from agent.agents.mcp_client_cache import LazyMCPTools
 
 class UserIdInjector(ToolCallInterceptor):
     """
@@ -55,9 +55,17 @@ class BillingAgentNode:
         config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'mcp_servers.json')
         with open(config_path, 'r', encoding='utf-8') as f:
             self.servers_config = json.load(f)
+        self._mcp_tools = LazyMCPTools(
+            self.servers_config.get("mcpServers", {}),
+            {"query_user_orders", "query_user_instances"},
+            interceptors_factory=lambda: [UserIdInjector()],
+        )
 
     async def _ensure_tools(self):
-        pass
+        return await self._mcp_tools.get_tools()
+
+    async def close(self):
+        await self._mcp_tools.close()
 
     async def __call__(self, state: AgentState) -> Dict[str, Any]:
         """供主 LangGraph 调用的处理函数"""
@@ -94,14 +102,7 @@ class BillingAgentNode:
         #connections: 传入配置文件（mcp_servers.json）里定义的服务地址，告诉 Agent 去哪里找数据。
         #tool_interceptors=[UserIdInjector()]: 这是关键的安全组件。它挂载了一个拦截器，
         # 确保后续调用任何工具时，都会自动、强制地注入当前用户的真实 user_id（就是你之前问的那段拦截逻辑）
-        client = MultiServerMCPClient(
-            connections=self.servers_config.get("mcpServers", {}),
-            tool_interceptors=[UserIdInjector()]
-        )
-        all_tools = await client.get_tools()
-        #权限白名单过滤
-        allowed_tool_names = {"query_user_orders", "query_user_instances"}
-        tools = [tool for tool in all_tools if tool.name in allowed_tool_names]
+        tools = await self._ensure_tools()
 
         inner_agent = create_react_agent(
             model=self.llm,
